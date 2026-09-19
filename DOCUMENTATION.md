@@ -39,8 +39,8 @@ NetworkIdentity identity = new NetworkIdentity(0);
 NetworkManager.AddIdentity(identity);
 ```
 
-### RPC's
-To use RPC's, you need to make sure you are, Connected to a server and in a room
+### RPCs
+To use RPCs, you need to make sure you are, Connected to a server and in a room
 #### Creating an RPC
 Without Parameters
 ```cs
