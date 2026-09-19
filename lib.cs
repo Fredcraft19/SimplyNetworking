@@ -1,17 +1,10 @@
 using SimplyNetworking.API.Internal;
 using SimplyNetworking.API.Types;
-using System;
-using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.ComponentModel.DataAnnotations;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Authentication;
 using System.Text;
-using System.Threading.Tasks;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace SimplyNetworking
 {
@@ -73,6 +66,17 @@ namespace SimplyNetworking
             public static void AddIdentity(NetworkIdentity i)
             {
                 identitys[i.ObjectID] = i;
+            }
+            public static void AddPendingNetworkVariableSet(uint objectId, string varName, byte[] value)
+            {
+                if (identitys.ContainsKey(objectId))
+                {
+                    identitys[objectId].SetNetworkVariable(varName, value);
+                }
+                else
+                {
+                    Log.Error($"Identity with ID '{objectId}' doesn't exist. Can't set Network Variables '{varName}' value");
+                }
             }
 
             public static void Initialize(IPAddress serverIP = null, int serverPort = 8082)
@@ -172,12 +176,20 @@ namespace SimplyNetworking
                 client.SendPacket(joinRoom);
             }
 
+
             /// <summary>
             /// Don't use this please, unless you know what your doing.
             /// </summary>
             public static void SendPacket(Packet packet)
             {
                 client.SendPacket(packet);
+            }
+            /// <summary>
+            /// Don't use this please, unless you know what your doing.
+            /// </summary>
+            public static void SendReliablePacket(Packet packet)
+            {
+                client.SendReliablePacket(packet);
             }
 
         }
@@ -188,10 +200,33 @@ namespace SimplyNetworking
 
             private readonly Dictionary<string, Delegate> bindedRpcs = new Dictionary<string, Delegate>();
 
+            /// <summary>
+            /// Leave unless you know what your doing please!
+            /// </summary>
+            private readonly Dictionary<string, NetworkVariableBase> networkVariables = new();
+
             public NetworkIdentity(uint id)
             {
                 ObjectID = id;
                 NetworkManager.AddIdentity(this);
+            }
+
+            public void AddNetworkVaribale(NetworkVariableBase networkVariable)
+            {
+                networkVariable.NetworkIdentityGetID(this);
+                networkVariables[networkVariable.Name] = networkVariable;
+            }
+
+            public void SetNetworkVariable(string name, byte[] value)
+            {
+                if (networkVariables.ContainsKey(name))
+                {
+                    networkVariables[name].DeserializeValue(value);
+                }
+                else
+                {
+                    Log.Error($"Network Variable '{name}' does not exist, can't set its value");
+                }
             }
 
             /// <summary>
@@ -222,7 +257,7 @@ namespace SimplyNetworking
                         cmd = Command.RPC,
                         data = [(byte)target, .. BitConverter.GetBytes(ObjectID), .. BitConverter.GetBytes(Encoding.UTF8.GetByteCount(rpcName)), .. Encoding.UTF8.GetBytes(rpcName), .. paramBytes]
                     };
-                    NetworkManager.SendPacket(packet);
+                    NetworkManager.SendReliablePacket(packet);
 
                     if (RpcTarget.All == target)
                         RunRPC(rpcName, paramBytes);
@@ -442,11 +477,6 @@ namespace SimplyNetworking
                                                 }
                                                 break;
                                             }
-                                        case Command.Reciept:
-                                            {
-                                                Log.Message($"Reciept recived for my previous command: {packet.cmd} : ID {packet.packetID}");
-                                                break;
-                                            }
                                         case Command.SetID:
                                             {
                                                 Log.Warn($"Server Recieved a SetID command from Client: {packet.senderID}. Ignoring it.");
@@ -468,7 +498,7 @@ namespace SimplyNetworking
                                                     clients[packet.senderID].MasterClient = false;
                                                     rooms[clients[packet.senderID].Room].ClientIDs.Remove(packet.senderID);
 
-                                                    
+
 
                                                     if (rooms[clients[packet.senderID].Room].ClientIDs.Count == 0)
                                                     {
@@ -502,6 +532,60 @@ namespace SimplyNetworking
                                                 }
 
                                                 UpdateClientState(packet.senderID);
+                                                break;
+                                            }
+                                        case Command.Reciept:
+                                            {
+                                                if (packet.data != null && packet.data.Length >= 4)
+                                                {
+                                                    uint packedID = BitConverter.ToUInt32(packet.data, 0);
+                                                    server.reliablePackets.TryRemove(packedID, out _);
+                                                }
+                                                break;
+                                            }
+                                        case Command.RPC: // sent via reliable
+                                            {
+                                                // Send Reciept
+                                                EndPointPacket reciept = new EndPointPacket
+                                                {
+                                                    packet = new Packet
+                                                    {
+                                                        cmd = Command.Reciept,
+                                                        data = [.. BitConverter.GetBytes(packet.packetID)]
+                                                    },
+                                                    endPoint = clients[packet.senderID].ep
+                                                };
+
+                                                server.SendPacket(reciept);
+
+                                                // Relay
+                                                RelayPacket(packet, packet.senderID, clients[packet.senderID].Room);
+
+
+                                                break;
+                                            }
+                                        case Command.NetworkVariable:
+                                            {
+                                                NetworkDelivery delivery = (NetworkDelivery)packet.data[0];
+
+                                                if (delivery == NetworkDelivery.Reliable)
+                                                {
+                                                    EndPointPacket reciept = new EndPointPacket
+                                                    {
+                                                        packet = new Packet
+                                                        {
+                                                            cmd = Command.Reciept,
+                                                            data = [.. BitConverter.GetBytes(packet.packetID)]
+                                                        },
+                                                        endPoint = clients[packet.senderID].ep
+                                                    };
+                                                    server.SendPacket(reciept);
+                                                }
+
+                                                // Relay
+                                                RelayPacket(packet, packet.senderID, clients[packet.senderID].Room);
+
+
                                                 break;
                                             }
                                         default:    // relay
@@ -568,7 +652,150 @@ namespace SimplyNetworking
         }
         namespace Types
         {
+            public static class ByteHelper
+            {
+                public static byte[] SerializeValue<T>(T _value)
+                {
+                    using var ms = new MemoryStream();
+                    using var writer = new BinaryWriter(ms);
 
+                    switch (_value)
+                    {
+                        case int v: writer.Write(v); break;
+                        case float v: writer.Write(v); break;
+                        case double v: writer.Write(v); break;
+                        case bool v: writer.Write(v); break;
+                        case string v: writer.Write(v ?? string.Empty); break;
+                        case byte[] v: writer.Write(v); break;
+                        case ushort v: writer.Write(v); break;
+                        case uint v: writer.Write(v); break;
+                        case long v: writer.Write(v); break;
+
+                        default:
+                            throw new NotSupportedException($"Type {typeof(T).Name} is not supported for NetworkVariable serialization.");
+                    }
+
+                    return ms.ToArray();
+                }
+                public static T DeserializeValue<T>(byte[] data)
+                {
+                    using var ms = new MemoryStream(data);
+                    using var reader = new BinaryReader(ms);
+                    Type type = typeof(T);
+
+                    object result = type switch
+                    {
+                        _ when type == typeof(int) => reader.ReadInt32(),
+                        _ when type == typeof(float) => reader.ReadSingle(),
+                        _ when type == typeof(double) => reader.ReadDouble(),
+                        _ when type == typeof(bool) => reader.ReadBoolean(),
+                        _ when type == typeof(string) => reader.ReadString(),
+                        _ when type == typeof(byte[]) => reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position)),
+                        _ when type == typeof(ushort) => reader.ReadUInt16(),
+                        _ when type == typeof(uint) => reader.ReadUInt32(),
+                        _ when type == typeof(long) => reader.ReadInt64(),
+
+                        _ => throw new NotSupportedException($"Type {type.Name} is not supported for NetworkVariable deserialization.")
+                    };
+
+                    return (T)result;
+                }
+            }
+            public abstract class NetworkVariableBase
+            {
+                public string Name { get; set; }
+                public abstract object RawValue { get; set; }
+                public abstract bool IsDirty { get; internal set; }
+                public abstract void DeserializeValue(byte[] data);
+                internal uint objectId;
+
+                /// <summary>
+                /// Dont use this unless you know what your doing please.
+                /// </summary>
+                /// <param name="id"></param>
+                public void NetworkIdentityGetID(NetworkIdentity id)
+                {
+                    objectId = id.ObjectID;
+                }
+            }
+
+            public class NetworkVariable<T> : NetworkVariableBase
+            {
+
+                public NetworkDelivery delivery;
+
+                public NetworkVariable(string name, T defaultValue = default, NetworkDelivery _delivery = NetworkDelivery.Reliable)
+                {
+                    Name = name;
+                    _value = defaultValue;
+                    delivery = _delivery;
+                }
+
+
+                private T _value;
+                public T Value
+                {
+                    get => _value;
+                    set
+                    {
+                        if (!EqualityComparer<T>.Default.Equals(_value, value))
+                        {
+                            _value = value;
+                            IsDirty = true;
+
+                            // Sync accross network
+
+                            Log.Message($"Syncing Value of '{Name}' to '{_value.ToString()}'");
+
+                            byte[] nameBytes = Encoding.UTF8.GetBytes(Name);
+
+                            Packet sync = new Packet
+                            {
+                                cmd = Command.NetworkVariable,
+                                data = [(byte)delivery, .. BitConverter.GetBytes(objectId), .. BitConverter.GetBytes(nameBytes.Length), .. nameBytes, .. ByteHelper.SerializeValue<T>(_value)]
+                            };
+
+                            if (delivery == NetworkDelivery.Reliable)
+                            {
+                                NetworkManager.SendReliablePacket(sync);
+                            }
+                            else
+                            {
+                                NetworkManager.SendPacket(sync);
+                            }
+                        }
+                    }
+                }
+
+                public override object RawValue
+                {
+                    get => Value;
+                    set => Value = (T)value;
+                }
+
+                public override bool IsDirty { get; internal set; }
+
+
+                public override void DeserializeValue(byte[] data)
+                {
+                    _value = ByteHelper.DeserializeValue<T>(data);
+                    Log.Message($"Set value of '{Name}' to '{_value.ToString()}'");
+                }
+            }
+            /// <summary>
+            /// Network Delivery types for Network Variables
+            /// </summary>
+            public enum NetworkDelivery
+            {
+                /// <summary>
+                /// For Fast, High frequency updates
+                /// </summary>
+                Unreliable,
+                /// <summary>
+                /// For slow, occasional updates
+                /// </summary>
+                Reliable
+            }
             public struct Packet
             {
                 public uint senderID;
@@ -667,6 +894,7 @@ namespace SimplyNetworking
                 private Client_ client;
                 private uint packetCount = 0;
                 private ConcurrentQueue<Packet> pendingPackets = new ConcurrentQueue<Packet>();
+                private readonly ConcurrentDictionary<uint, (Packet packet, DateTime sentTime)> reliablePackets = new();
                 public HClient(IPAddress ip, int port = 8082)
                 {
                     client = new Client_();
@@ -684,9 +912,31 @@ namespace SimplyNetworking
                         {
                             try
                             {
+                                DateTime now = DateTime.UtcNow;
+                                List<(uint packetID, Packet packet, DateTime time)> packetsToOverwrite = new();
+                                foreach (var entry in reliablePackets)
+                                {
+                                    uint packetID = entry.Key;
+                                    var (packet, sentTime) = entry.Value;
+
+                                    if ((now - sentTime).TotalMilliseconds > 500)
+                                    {
+                                        packetsToOverwrite.Add((packetID, packet, now));
+
+                                        SendPacket(packet);
+                                        Log.Message("Sending again. reciept not recieved");
+                                    }
+                                }
+                                foreach (var x in packetsToOverwrite)
+                                {
+                                    reliablePackets[x.packetID] = (x.packet, x.time);
+                                }
+
+
                                 while (pendingPackets.TryDequeue(out Packet packet))
                                 {
                                     await client.Send(packet.Serialize());
+
                                 }
                             }
                             catch (Exception e)
@@ -761,6 +1011,15 @@ namespace SimplyNetworking
                                                 }
                                                 break;
                                             }
+                                        case Command.Reciept:
+                                            {
+                                                if (packet.data != null && packet.data.Length >= 4)
+                                                {
+                                                    uint packedID = BitConverter.ToUInt32(packet.data, 0);
+                                                    reliablePackets.TryRemove(packedID, out _);
+                                                }
+                                                break;
+                                            }
                                         case Command.RPC:
                                             {
                                                 RpcTarget rpc_target = (RpcTarget)packet.data[0];
@@ -781,6 +1040,33 @@ namespace SimplyNetworking
 
                                                     NetworkManager.AddPendingRPC(rpc);
                                                 }
+
+                                                Packet reciept = new Packet
+                                                {
+                                                    cmd = Command.Reciept,
+                                                    data = [.. BitConverter.GetBytes(packet.packetID)]
+                                                };
+                                                SendPacket(reciept);
+
+                                                break;
+                                            }
+                                        case Command.NetworkVariable:
+                                            {
+                                                if ((NetworkDelivery)packet.data[0] == NetworkDelivery.Reliable)
+                                                {
+                                                    Packet reciept = new Packet
+                                                    {
+                                                        cmd = Command.Reciept,
+                                                        data = [.. BitConverter.GetBytes(packet.packetID)]
+                                                    };
+                                                    SendPacket(reciept);
+                                                }
+
+                                                uint objectId = BitConverter.ToUInt32(packet.data, 1);
+                                                int nameLen = BitConverter.ToInt32(packet.data, 5);
+                                                string var_name = Encoding.UTF8.GetString(packet.data, 9, nameLen);
+
+                                                NetworkManager.AddPendingNetworkVariableSet(objectId, var_name, packet.data[(9 + nameLen)..]);
 
                                                 break;
                                             }
@@ -805,12 +1091,32 @@ namespace SimplyNetworking
 
                     pendingPackets.Enqueue(packet);
                 }
+                public void SendReliablePacket(Packet packet)
+                {
+                    if (packet.cmd == Command.RPC || (packet.cmd == Command.NetworkVariable && (NetworkDelivery)packet.data[0] == NetworkDelivery.Reliable))
+                    {
+                        if (packetCount > 4200000000)
+                            packetCount = 1;
+
+                        packet.packetID = packetCount++;
+                        packet.senderID = ID;
+
+                        pendingPackets.Enqueue(packet);
+                        reliablePackets[packet.packetID] = (packet, DateTime.UtcNow);
+                    }
+                    else
+                    {
+                        Log.Warn("Can't send a non-rpc command reliably. (sending unreliably)");
+                        SendPacket(packet);
+                    }
+                }
             }
             public class HServer
             {
                 public Server_ server;
                 private uint packetCount = 0;
                 private ConcurrentQueue<EndPointPacket> pendingPackets = new ConcurrentQueue<EndPointPacket>();
+                public readonly ConcurrentDictionary<uint, (EndPointPacket packet, DateTime sentTime)> reliablePackets = new();
                 public HServer()
                 {
                     server = new Server_();
@@ -826,6 +1132,20 @@ namespace SimplyNetworking
                         {
                             try
                             {
+                                DateTime now = DateTime.UtcNow;
+                                foreach (var entry in reliablePackets)
+                                {
+                                    uint packetID = entry.Key;
+                                    var (packet, sentTime) = entry.Value;
+
+                                    if ((now - sentTime).TotalMilliseconds > 500)
+                                    {
+                                        reliablePackets[packetID] = (packet, now);
+
+                                        SendPacket(packet);
+                                        Log.Message("Sending again. reciept not recieved");
+                                    }
+                                }
                                 while (pendingPackets.TryDequeue(out EndPointPacket epp))
                                 {
                                     await server.SendTo(epp.endPoint, epp.packet.Serialize());
@@ -847,6 +1167,23 @@ namespace SimplyNetworking
                     epp.packet.packetID = packetCount++;
                     epp.packet.senderID = 0;
                     pendingPackets.Enqueue(epp);
+                }
+                public void SendReliablePacket(EndPointPacket epp)
+                {
+                    if (epp.packet.cmd == Command.RPC || (epp.packet.cmd == Command.NetworkVariable && (NetworkDelivery)epp.packet.data[0] == NetworkDelivery.Reliable))
+                    {
+                        if (packetCount > 4200000000)
+                            packetCount = 1;
+                        epp.packet.packetID = packetCount++;
+                        epp.packet.senderID = 0;
+                        pendingPackets.Enqueue(epp);
+                        reliablePackets[epp.packet.packetID] = (epp, DateTime.UtcNow);
+                    }
+                    else
+                    {
+                        Log.Warn("Can't send a non-rpc command reliably. (sending unreliably)");
+                        SendPacket(epp);
+                    }
                 }
             }
 
@@ -978,3 +1315,4 @@ namespace SimplyNetworking
         }
     }
 }
+
