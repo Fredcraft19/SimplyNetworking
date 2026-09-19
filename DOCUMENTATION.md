@@ -79,6 +79,13 @@ With Parameters
 identity.RPC("method", RpcTarget.All, 2, "Cool Text");
 ```
 
+RpcTargets
+```cs
+RpcTarget.All    - Runs RPC on all clients
+RpcTarget.Others - Runs RPC on all clients except the caller
+RpcTarget.Master - Runs RPC on the master client in the room
+```
+
 ### Network Variables
 To use Network Variables, you need to make sure you are, Connected to a server and in a room
 #### Creating a Network Variable
