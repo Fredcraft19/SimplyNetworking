@@ -91,7 +91,7 @@ NetworkVariable<int> number = new NetworkVariable<int>("cool_number", 1, Network
 // "cool_number" is just a unique name for the variable
 // 1 is the default value for the network variable
 // NetworkDelivery is how you want it to be delivered:
-//     NetworkDelivery.Unreliable is recommended if the variable will be changed a lot (more than once a second), can drop packets
+//     NetworkDelivery.Unreliable is recommended if the variable will be changed a lot, can drop packets
 //     NetworkDelivery.Reliable is recommended if the variable is changed less than once a second, doesn't drop packets
 
 // Add it to a Network Identity
