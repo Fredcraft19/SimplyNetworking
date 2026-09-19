@@ -102,7 +102,7 @@ NetworkVariable<int> number = new NetworkVariable<int>("cool_number", 1, Network
 //     NetworkDelivery.Reliable is recommended if the variable is changed less than once a second, doesn't drop packets
 
 // Add it to a Network Identity
-identity.AddNetworkVaribale(number);
+identity.AddNetworkVariable(number);
 ```
 #### Changing value
 ```cs
